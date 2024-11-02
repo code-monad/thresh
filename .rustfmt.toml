@@ -1,0 +1,5 @@
+reorder_imports = true
+edition = "2021"
+brace_style = "SameLineWhere"
+wrap_comments = true
+where_single_line = true
