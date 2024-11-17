@@ -1,0 +1,18 @@
+websocket:
+    endpoint: "ws://localhost:8114"
+    retry_interval: 2
+    max_retries: 5
+    ping_interval: 15
+
+mqtt:
+    broker: "localhost"
+    port: 1883
+    topic: "ckb.transactions.dev"
+    client_id: "thresh-monitor-dev"
+    qos: 1
+    reconnect_delay: 2
+    batch_size: 10
+
+processing:
+    workers: 2
+    queue_size: 100
