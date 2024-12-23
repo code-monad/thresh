@@ -67,13 +67,15 @@ where
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct MqttConfig {
-    pub broker: String,    // MQTT broker address
-    pub port: u16,         // MQTT broker port
-    pub client_id: String, // Client identifier
+    pub broker: String,           // MQTT broker address
+    pub port: u16,                // MQTT broker port
+    pub client_id: String,        // Client identifier
+    pub username: Option<String>, // Username
+    pub password: Option<String>, // Password
     #[serde(deserialize_with = "deserialize_qos")]
     pub qos: QoS, // Quality of Service level
-    pub reconnect_delay: u64, // Reconnection delay in seconds
-    pub batch_size: usize, // Message batch size
+    pub reconnect_delay: u64,     // Reconnection delay in seconds
+    pub batch_size: usize,        // Message batch size
 }
 
 #[derive(Debug, Deserialize, Clone)]

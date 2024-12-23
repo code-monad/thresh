@@ -26,6 +26,8 @@ async fn main() -> Result<()> {
             config.mqtt.broker.clone(),
             config.mqtt.port,
             config.mqtt.client_id.clone(),
+            config.mqtt.username.clone(),
+            config.mqtt.password.clone(),
             rx,
             config.mqtt.batch_size, // Add batch_size parameter,
             config.mqtt.qos,

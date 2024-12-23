@@ -1,5 +1,4 @@
 use crate::{error::Result, websocket::TopicMessage};
-use backoff::{Error as BackoffError, ExponentialBackoff};
 use rumqttc::{AsyncClient, MqttOptions, QoS};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -17,12 +16,20 @@ impl MqttPublisher {
         broker: String,
         port: u16,
         client_id: String,
+        username: Option<String>,
+        password: Option<String>,
         rx: mpsc::Receiver<TopicMessage>,
         batch_size: usize,
         qos: QoS,
     ) -> Result<Self> {
         let mut mqttopts = MqttOptions::new(client_id, broker, port);
+        if username.is_some() {
+            mqttopts.set_credentials(username.unwrap_or_default(), password.unwrap_or_default());
+        }
+
         mqttopts.set_keep_alive(Duration::from_secs(5));
+        mqttopts.set_max_packet_size(10 * 1024 * 1024, 10 * 1024 * 1024); // 10MB for both send and receive
+        mqttopts.set_clean_session(true);
 
         let (client, mut eventloop) = AsyncClient::new(mqttopts, 10);
 
