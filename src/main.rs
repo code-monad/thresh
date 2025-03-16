@@ -22,6 +22,7 @@ async fn main() -> Result<()> {
             config.websocket.clone(),
         );
 
+        let reconnect_delay = Duration::from_secs(config.mqtt.reconnect_delay);
         let mut mqtt_publisher = MqttPublisher::new(
             config.mqtt.broker.clone(),
             config.mqtt.port,
@@ -29,8 +30,9 @@ async fn main() -> Result<()> {
             config.mqtt.username.clone(),
             config.mqtt.password.clone(),
             rx,
-            config.mqtt.batch_size, // Add batch_size parameter,
+            config.mqtt.batch_size,
             config.mqtt.qos,
+            reconnect_delay,
         )
         .await?;
 
