@@ -110,10 +110,43 @@ impl MqttPublisher {
         self.client = client;
         self.eventloop = Some(eventloop);
         
+        // Set a dummy listener to verify connection
+        // This is a more reliable way than subscribing to topics that might not exist
+        match self.client.publish("thresh/connection_test", QoS::AtMostOnce, false, vec![1u8]).await {
+            Ok(_) => {
+                // Update connection health status to true
+                let _ = self.health_sender.send(true);
+                info!("MQTT connection verified");
+            },
+            Err(e) => {
+                error!("Failed to verify MQTT connection: {}", e);
+                let _ = self.health_sender.send(false);
+            }
+        }
+        
         Ok(())
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        // Initial connection health check
+        match self.client.publish("thresh/connection_test", QoS::AtMostOnce, false, vec![1u8]).await {
+            Ok(_) => {
+                // Successfully published, connection is healthy
+                let _ = self.health_sender.send(true);
+                info!("Initial MQTT connection verified");
+            },
+            Err(e) => {
+                error!("Initial connection health check failed: {}", e);
+                let _ = self.health_sender.send(false);
+                
+                // Try to reconnect before proceeding
+                if let Err(e) = self.reconnect().await {
+                    error!("Failed to establish initial connection: {}", e);
+                    return Err(e);
+                }
+            }
+        }
+
         // Spawn the event loop handler
         let health_sender = self.health_sender.clone();
         let mut eventloop = self.eventloop.take().expect("EventLoop should be initialized");
@@ -145,14 +178,23 @@ impl MqttPublisher {
                             },
                             rumqttc::Packet::PingResp => {
                                 debug!("Received MQTT ping response");
+                                // Also mark connection as healthy when we receive a ping response
+                                let _ = health_sender.send(true);
                             },
                             rumqttc::Packet::Disconnect => {
                                 info!("MQTT client disconnected");
                                 let _ = health_sender.send(false);
                                 break;
                             },
+                            rumqttc::Packet::PubAck(_) | rumqttc::Packet::PubComp(_) => {
+                                // PubAck and PubComp confirm successful message delivery
+                                // This is a good indicator of a healthy connection
+                                let _ = health_sender.send(true);
+                                debug!("Received message acknowledgement from broker");
+                            },
                             _ => {
-                                // Other packets we don't need to handle specifically
+                                // Any other incoming packet also indicates a working connection
+                                let _ = health_sender.send(true);
                             }
                         }
                     },
@@ -227,8 +269,27 @@ impl MqttPublisher {
                             error!("Failed to reconnect to MQTT broker: {}", e);
                         }
                     } else {
-                        // Check connection health via regular health check
-                        debug!("MQTT connection health check passed");
+                        // Actively verify the connection is still alive with a publish test
+                        match self.client.publish("thresh/connection_test", QoS::AtMostOnce, false, vec![1u8]).await {
+                            Ok(_) => {
+                                // Update health status - connection is good
+                                let _ = self.health_sender.send(true);
+                                debug!("MQTT connection health verified");
+                            },
+                            Err(e) => {
+                                // Connection failed verification
+                                error!("MQTT connection verification failed: {}", e);
+                                let _ = self.health_sender.send(false);
+                                
+                                // Try to reconnect immediately
+                                if !self.is_reconnecting.load(Ordering::SeqCst) {
+                                    warn!("MQTT connection appears to be down, attempting to reconnect...");
+                                    if let Err(e) = self.reconnect().await {
+                                        error!("Failed to reconnect to MQTT broker: {}", e);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -275,11 +336,29 @@ impl MqttPublisher {
         match self.connect().await {
             Ok(_) => {
                 info!("Successfully reconnected to MQTT broker");
+                
+                // Explicitly update the health status
+                let _ = self.health_sender.send(true);
+                
+                // Verify connection with a test publish
+                match self.client.publish("thresh/connection_test", QoS::AtMostOnce, false, vec![1u8]).await {
+                    Ok(_) => {
+                        info!("Reconnection verified with test publish");
+                    },
+                    Err(e) => {
+                        error!("Failed to verify reconnection: {}", e);
+                        let _ = self.health_sender.send(false);
+                        self.is_reconnecting.store(false, Ordering::SeqCst);
+                        return Err(e.into());
+                    }
+                }
+                
                 self.is_reconnecting.store(false, Ordering::SeqCst);
                 Ok(())
             },
             Err(e) => {
                 error!("Failed to reconnect: {}", e);
+                let _ = self.health_sender.send(false);
                 self.is_reconnecting.store(false, Ordering::SeqCst);
                 Err(e)
             }
