@@ -6,9 +6,10 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tokio::time;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug)]
 pub struct TopicMessage {
@@ -21,15 +22,21 @@ pub struct WebSocketClient {
     tx: mpsc::Sender<TopicMessage>,
     config: WebSocketConfig,
     subscription_map: Mutex<HashMap<String, String>>, // subscription_id -> topic_name
+    health_sender: watch::Sender<bool>,
+    health_receiver: watch::Receiver<bool>,
 }
 
 impl WebSocketClient {
     pub fn new(endpoint: String, tx: mpsc::Sender<TopicMessage>, config: WebSocketConfig) -> Self {
+        let (health_sender, health_receiver) = watch::channel(false);
+        
         Self {
             endpoint,
             tx,
             config,
             subscription_map: Mutex::new(HashMap::new()),
+            health_sender,
+            health_receiver,
         }
     }
 
@@ -54,8 +61,25 @@ impl WebSocketClient {
             "Sending subscription request for {}: {}",
             topic.name, subscribe_msg
         );
-        write.send(Message::Text(subscribe_msg.to_string())).await?;
-        debug!("Subscription request for {} sent successfully", topic.name);
+        
+        // Add timeout for the send operation
+        let send_future = write.send(Message::Text(subscribe_msg.to_string()));
+        match time::timeout(Duration::from_secs(10), send_future).await {
+            Ok(result) => {
+                result?;
+                debug!("Subscription request for {} sent successfully", topic.name);
+            }
+            Err(_) => {
+                error!(
+                    "Timeout while sending subscription request for {}",
+                    topic.name
+                );
+                return Err(Error::Connection(format!(
+                    "Subscription request timeout for {}",
+                    topic.name
+                )));
+            }
+        }
 
         Ok(())
     }
@@ -71,7 +95,37 @@ impl WebSocketClient {
     ) -> Result<()> {
         for topic in self.config.topics.iter().filter(|t| t.enabled) {
             info!("Subscribing to topic: {}", topic.name);
-            self.subscribe_to_topic(write, topic).await?;
+
+            // Try to subscribe with retries
+            let mut retries = 0;
+            let max_retries = 3;
+            let mut delay = 100; // ms
+
+            loop {
+                match self.subscribe_to_topic(write, topic).await {
+                    Ok(_) => break,
+                    Err(e) => {
+                        retries += 1;
+                        if retries >= max_retries {
+                            error!(
+                                "Failed to subscribe to {} after {} attempts: {}",
+                                topic.name, max_retries, e
+                            );
+                            return Err(Error::Connection(format!(
+                                "Failed to subscribe to {}",
+                                topic.name
+                            )));
+                        }
+
+                        error!(
+                            "Failed to subscribe to {}, retrying in {}ms: {}",
+                            topic.name, delay, e
+                        );
+                        time::sleep(Duration::from_millis(delay)).await;
+                        delay *= 2; // Exponential backoff
+                    }
+                }
+            }
 
             // Wait a short time between subscriptions
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -88,6 +142,8 @@ impl WebSocketClient {
             }
             Message::Close(frame) => {
                 error!("Received close frame: {:?}", frame);
+                // Set health status to false
+                let _ = self.health_sender.send(false);
                 Err(Error::Connection("Server closed connection".into()))
             }
             _ => {
@@ -137,6 +193,9 @@ impl WebSocketClient {
 
         if let Ok(mut map) = self.subscription_map.lock() {
             map.insert(subscription_id.to_string(), topic.name.clone());
+        } else {
+            error!("Failed to acquire lock for subscription map");
+            return None;
         }
 
         Some(())
@@ -162,10 +221,33 @@ impl WebSocketClient {
 
         debug!("Found subscription: {} and result", subscription);
 
-        let topic = self.get_topic_for_subscription(subscription)?;
-        let transaction = self.parse_transaction_from_result(result)?;
+        let topic = match self.get_topic_for_subscription(subscription) {
+            Ok(topic) => topic,
+            Err(e) => {
+                error!("Error getting topic for subscription {}: {}", subscription, e);
+                return Ok(());
+            }
+        };
+        
+        let transaction = match self.parse_transaction_from_result(result) {
+            Ok(tx) => tx,
+            Err(e) => {
+                error!("Error parsing transaction from result: {}", e);
+                return Ok(());
+            }
+        };
 
-        self.send_transaction_message(topic, transaction).await
+        // Use timeout for sending to prevent blocking indefinitely
+        match time::timeout(
+            Duration::from_secs(5),
+            self.send_transaction_message(topic, transaction)
+        ).await {
+            Ok(result) => result,
+            Err(_) => {
+                error!("Timeout while sending transaction message to MQTT");
+                Err(Error::Connection("Timeout sending to MQTT".into()))
+            }
+        }
     }
 
     /// Retrieves the corresponding topic configuration for a given subscription ID
@@ -230,11 +312,31 @@ impl WebSocketClient {
 
     async fn connect_and_process(&self) -> Result<()> {
         info!("Connecting to WebSocket endpoint: {}", self.endpoint);
-        let (ws_stream, _) = connect_async(&self.endpoint).await?;
+        
+        // Add timeout for the connection
+        let connect_future = connect_async(&self.endpoint);
+        let ws_stream = match time::timeout(Duration::from_secs(30), connect_future).await {
+            Ok(result) => {
+                let (stream, _) = result?;
+                stream
+            },
+            Err(_) => {
+                error!("Timeout while connecting to WebSocket endpoint: {}", self.endpoint);
+                return Err(Error::Connection("Connection timeout".into()));
+            }
+        };
+        
+        // Set health status to true once connected
+        let _ = self.health_sender.send(true);
+        
         let (mut write, mut read) = ws_stream.split();
 
         // Send subscription immediately after connection
-        self.subscribe_all(&mut write).await?;
+        if let Err(e) = self.subscribe_all(&mut write).await {
+            error!("Failed to subscribe to topics: {}", e);
+            let _ = self.health_sender.send(false);
+            return Err(e);
+        }
 
         // Set up ping/pong keepalive
         let write = Arc::new(tokio::sync::Mutex::new(write));
@@ -242,13 +344,13 @@ impl WebSocketClient {
 
         // Spawn ping task
         let ping_handle = {
-            let interval = self.config.ping_interval;
+            let interval_secs = self.config.ping_interval;
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(interval));
+                let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
                 loop {
                     interval.tick().await;
-                    let mut write = write_clone.lock().await;
-                    if let Err(e) = write.send(Message::Ping(vec![])).await {
+                    let mut locked_write = write_clone.lock().await;
+                    if let Err(e) = locked_write.send(Message::Ping(vec![])).await {
                         error!("Failed to send ping: {}", e);
                         break;
                     }
@@ -257,35 +359,59 @@ impl WebSocketClient {
         };
 
         let mut consecutive_errors = 0;
+        let max_idle_time = Duration::from_secs(self.config.ping_interval * 2);
 
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(msg) => {
-                    consecutive_errors = 0;
-                    if let Err(e) = self.handle_message(msg).await {
-                        error!("Error handling message: {}", e);
-                        return Err(e);
+        loop {
+            match time::timeout(max_idle_time, read.next()).await {
+                Ok(Some(msg_result)) => {
+                    match msg_result {
+                        Ok(msg) => {
+                            consecutive_errors = 0;
+                            let _ = self.health_sender.send(true);
+
+                            if let Err(e) = self.handle_message(msg).await {
+                                error!("Error handling message: {}", e);
+                                if matches!(e, Error::Connection(_)) {
+                                    let _ = self.health_sender.send(false);
+                                    ping_handle.abort();
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("WebSocket error: {}", e);
+                            consecutive_errors += 1;
+                            let _ = self.health_sender.send(false);
+
+                            if consecutive_errors >= self.config.max_retries {
+                                ping_handle.abort();
+                                return Err(Error::Connection("Too many consecutive errors".into()));
+                            }
+                            time::sleep(Duration::from_millis(100)).await;
+                        }
                     }
                 }
-                Err(e) => {
-                    error!("WebSocket error: {}", e);
-                    consecutive_errors += 1;
-                    if consecutive_errors >= self.config.max_retries {
-                        return Err(Error::Connection("Too many consecutive errors".into()));
-                    }
+                Ok(None) => {
+                    info!("WebSocket connection closed by remote.");
+                    let _ = self.health_sender.send(false);
+                    ping_handle.abort();
+                    return Err(Error::Connection("WebSocket connection closed".into()));
+                }
+                Err(_) => {
+                    warn!("WebSocket idle timeout after {:?}, assuming connection is dead.", max_idle_time);
+                    let _ = self.health_sender.send(false);
+                    ping_handle.abort();
+                    return Err(Error::Connection("WebSocket idle timeout".into()));
                 }
             }
         }
-
-        ping_handle.abort();
-        Err(Error::Connection("WebSocket connection closed".into()))
     }
 
     pub async fn run(&self) -> Result<()> {
         let backoff = ExponentialBackoff {
             initial_interval: Duration::from_secs(self.config.retry_interval),
             max_interval: Duration::from_secs(30),
-            max_elapsed_time: Some(Duration::from_secs(300)),
+            max_elapsed_time: None, // No maximum elapsed time - keep retrying indefinitely
             multiplier: 1.5,
             ..Default::default()
         };
@@ -295,11 +421,14 @@ impl WebSocketClient {
                 Ok(_) => Ok(()),
                 Err(e) => {
                     error!("Connection error: {}", e);
+                    // Set health status to false
+                    let _ = self.health_sender.send(false);
                     Err(BackoffError::transient(e))
                 }
             }
         };
 
+        // This will keep retrying with backoff
         match backoff::future::retry(backoff, operation).await {
             Ok(_) => Ok(()),
             Err(e) => Err(Error::Connection(e.to_string())),

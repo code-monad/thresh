@@ -54,9 +54,6 @@ VOLUME /app/config
 COPY docker/healthcheck.sh /app/healthcheck.sh
 RUN chmod +x /app/healthcheck.sh
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD /app/healthcheck.sh
 
 # Set the binary as entrypoint
 ENTRYPOINT ["/app/thresh"]
