@@ -68,10 +68,16 @@ impl WebSocketClient {
             Ok(result) => {
                 result?;
                 debug!("Subscription request for {} sent successfully", topic.name);
-            },
+            }
             Err(_) => {
-                error!("Timeout while sending subscription request for {}", topic.name);
-                return Err(Error::Connection(format!("Subscription request timeout for {}", topic.name)));
+                error!(
+                    "Timeout while sending subscription request for {}",
+                    topic.name
+                );
+                return Err(Error::Connection(format!(
+                    "Subscription request timeout for {}",
+                    topic.name
+                )));
             }
         }
 
@@ -89,23 +95,32 @@ impl WebSocketClient {
     ) -> Result<()> {
         for topic in self.config.topics.iter().filter(|t| t.enabled) {
             info!("Subscribing to topic: {}", topic.name);
-            
+
             // Try to subscribe with retries
             let mut retries = 0;
             let max_retries = 3;
             let mut delay = 100; // ms
-            
+
             loop {
                 match self.subscribe_to_topic(write, topic).await {
                     Ok(_) => break,
                     Err(e) => {
                         retries += 1;
                         if retries >= max_retries {
-                            error!("Failed to subscribe to {} after {} attempts: {}", topic.name, max_retries, e);
-                            return Err(Error::Connection(format!("Failed to subscribe to {}", topic.name)));
+                            error!(
+                                "Failed to subscribe to {} after {} attempts: {}",
+                                topic.name, max_retries, e
+                            );
+                            return Err(Error::Connection(format!(
+                                "Failed to subscribe to {}",
+                                topic.name
+                            )));
                         }
-                        
-                        error!("Failed to subscribe to {}, retrying in {}ms: {}", topic.name, delay, e);
+
+                        error!(
+                            "Failed to subscribe to {}, retrying in {}ms: {}",
+                            topic.name, delay, e
+                        );
                         time::sleep(Duration::from_millis(delay)).await;
                         delay *= 2; // Exponential backoff
                     }
@@ -329,13 +344,13 @@ impl WebSocketClient {
 
         // Spawn ping task
         let ping_handle = {
-            let interval = self.config.ping_interval;
+            let interval_secs = self.config.ping_interval;
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(interval));
+                let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
                 loop {
                     interval.tick().await;
-                    let mut write = write_clone.lock().await;
-                    if let Err(e) = write.send(Message::Ping(vec![])).await {
+                    let mut locked_write = write_clone.lock().await;
+                    if let Err(e) = locked_write.send(Message::Ping(vec![])).await {
                         error!("Failed to send ping: {}", e);
                         break;
                     }
@@ -344,87 +359,52 @@ impl WebSocketClient {
         };
 
         let mut consecutive_errors = 0;
-        
-        // Create a shared last activity time that can be updated from multiple places
-        let last_activity_time = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
-        let last_activity_time_clone = last_activity_time.clone();
-        
-        let max_idle_time = Duration::from_secs(60); // Consider connection dead if no messages for 60 seconds
+        let max_idle_time = Duration::from_secs(self.config.ping_interval * 2);
 
-        // Spawn a health check task
-        let health_sender_clone = self.health_sender.clone();
-        let health_receiver_clone = self.health_receiver.clone();
-        let health_check_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(15));
-            loop {
-                interval.tick().await;
-                
-                let elapsed = {
-                    let time = last_activity_time_clone.lock().unwrap();
-                    time.elapsed()
-                };
-                
-                if elapsed > max_idle_time {
-                    warn!("No WebSocket activity for {:?}, connection may be dead", elapsed);
-                    let _ = health_sender_clone.send(false);
-                } else if !*health_receiver_clone.borrow() {
-                    // If we have activity but health is false, try to restore it
-                    debug!("WebSocket activity detected but health status is false, restoring");
-                    let _ = health_sender_clone.send(true);
-                }
-            }
-        });
+        loop {
+            match time::timeout(max_idle_time, read.next()).await {
+                Ok(Some(msg_result)) => {
+                    match msg_result {
+                        Ok(msg) => {
+                            consecutive_errors = 0;
+                            let _ = self.health_sender.send(true);
 
-        while let Some(msg) = read.next().await {
-            // Update last activity time
-            {
-                let mut time = last_activity_time.lock().unwrap();
-                *time = std::time::Instant::now();
-            }
-            
-            match msg {
-                Ok(msg) => {
-                    consecutive_errors = 0;
-                    // Set health status to true as we're receiving messages
-                    let _ = self.health_sender.send(true);
-                    
-                    if let Err(e) = self.handle_message(msg).await {
-                        error!("Error handling message: {}", e);
-                        
-                        // If this is a connection error, break the loop to trigger reconnection
-                        if matches!(e, Error::Connection(_)) {
+                            if let Err(e) = self.handle_message(msg).await {
+                                error!("Error handling message: {}", e);
+                                if matches!(e, Error::Connection(_)) {
+                                    let _ = self.health_sender.send(false);
+                                    ping_handle.abort();
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("WebSocket error: {}", e);
+                            consecutive_errors += 1;
                             let _ = self.health_sender.send(false);
-                            ping_handle.abort();
-                            health_check_handle.abort();
-                            return Err(e);
+
+                            if consecutive_errors >= self.config.max_retries {
+                                ping_handle.abort();
+                                return Err(Error::Connection("Too many consecutive errors".into()));
+                            }
+                            time::sleep(Duration::from_millis(100)).await;
                         }
                     }
                 }
-                Err(e) => {
-                    error!("WebSocket error: {}", e);
-                    consecutive_errors += 1;
-                    
-                    // Set health status to false on error
+                Ok(None) => {
+                    info!("WebSocket connection closed by remote.");
                     let _ = self.health_sender.send(false);
-                    
-                    if consecutive_errors >= self.config.max_retries {
-                        ping_handle.abort();
-                        health_check_handle.abort();
-                        return Err(Error::Connection("Too many consecutive errors".into()));
-                    }
-                    
-                    // Add a small delay before continuing to prevent tight error loops
-                    time::sleep(Duration::from_millis(100)).await;
+                    ping_handle.abort();
+                    return Err(Error::Connection("WebSocket connection closed".into()));
+                }
+                Err(_) => {
+                    warn!("WebSocket idle timeout after {:?}, assuming connection is dead.", max_idle_time);
+                    let _ = self.health_sender.send(false);
+                    ping_handle.abort();
+                    return Err(Error::Connection("WebSocket idle timeout".into()));
                 }
             }
         }
-
-        // If we exit the loop, the connection is closed
-        let _ = self.health_sender.send(false);
-        ping_handle.abort();
-        health_check_handle.abort();
-        
-        Err(Error::Connection("WebSocket connection closed".into()))
     }
 
     pub async fn run(&self) -> Result<()> {
